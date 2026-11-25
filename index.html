@@ -118,6 +118,8 @@ input[type=checkbox]{accent-color:var(--accent);width:17px;height:17px;vertical-
 .timer{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:700}
 
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.chart{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.chart svg{display:block;width:100%;min-width:520px;height:auto}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
 th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;background:var(--panel)}
@@ -12434,6 +12436,8 @@ delete settings.shuffle;
 let stats    = LS.get('stats',{});
 let sessions = LS.get('sessions',[]);
 let results  = LS.get('results',[]);
+let rF={mode:'all',from:'',to:'',grp:''};
+let gh=Object.assign({owner:'niehslevap-blip',repo:'pte',path:'data/store.json',branch:'main',token:''},LS.get('gh',{}));
 let examSet  = LS.get('examSet',null);
 let adminSel = LS.get('adminSel',[]);
 let role=null, trainer=null, exam=null, view='home';
@@ -12447,6 +12451,68 @@ adminSel=adminSel.filter(id=>byId(id));
 const dt=t=>new Date(t).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 const fmtTime=sec=>{sec=Math.max(0,Math.round(sec||0));const m=Math.floor(sec/60),s=sec%60;return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')};
 function toast(msg){$('#toast').innerHTML='<div class="toast">'+esc(msg)+'</div>';clearTimeout(toast.t);toast.t=setTimeout(()=>$('#toast').innerHTML='',3500)}
+
+/* ---------------- ОНЛАЙН-СИНХРОНИЗАЦИЯ (GitHub) ---------------- */
+const ghUrl=()=> 'https://api.github.com/repos/'+encodeURIComponent(gh.owner)+'/'+encodeURIComponent(gh.repo)+
+  '/contents/'+gh.path.split('/').map(encodeURIComponent).join('/')+'?ref='+encodeURIComponent(gh.branch);
+const ghHeaders=auth=>{const h={'Accept':'application/vnd.github+json'};if(auth&&gh.token)h.Authorization='Bearer '+gh.token;return h};
+function b64ToStr(b){const bin=atob(String(b).replace(/\s/g,''));const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new TextDecoder('utf-8').decode(u)}
+function strToB64(s){const u=new TextEncoder().encode(s);let bin='';for(let i=0;i<u.length;i++)bin+=String.fromCharCode(u[i]);return btoa(bin)}
+function mergeResults(a,b){
+  const m=new Map();
+  [...(a||[]),...(b||[])].forEach(r=>{const k=[r.at,r.right,r.total,r.fio,r.grp].join('|');if(!m.has(k))m.set(k,r)});
+  return [...m.values()].sort((x,y)=>y.at-x.at);
+}
+function ghStatus(txt){const s=$('#ghStatus');if(s)s.textContent='Статус: '+txt}
+async function ghPull(silent){
+  try{
+    const res=await fetch(ghUrl(),{headers:ghHeaders(false)});
+    if(res.status===404){if(!silent){toast('Файла данных онлайн ещё нет — сохраните первый раз');ghStatus('файла онлайн ещё нет')}return false}
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const j=await res.json();
+    const data=JSON.parse(b64ToStr(j.content));
+    results=mergeResults(results,data.results||[]);
+    if(data.examSet&&data.examSet.ids){examSet=data.examSet;LS.set('examSet',examSet)}
+    if(data.settings){settings=Object.assign(settings,data.settings);LS.set('settings',settings)}
+    LS.set('results',results);
+    if(!silent){toast('Загружено из GitHub: '+results.length+' результатов');ghStatus('загружено '+results.length+' результатов');render()}
+    else render();
+    return true;
+  }catch(e){
+    if(!silent){toast('Ошибка загрузки: '+e.message);ghStatus('ошибка загрузки: '+e.message)}
+    return false;
+  }
+}
+async function ghPush(silent){
+  if(!gh.token){if(!silent){toast('Укажите токен GitHub в настройках подключения');ghStatus('токен не задан — только загрузка')}return false}
+  try{
+    const payload={v:1,updatedAt:Date.now(),results,
+      examSet:examSet||null,
+      settings:{passScore:settings.passScore,examTime:settings.examTime,examCount:settings.examCount,excludeVerify:settings.excludeVerify}};
+    let sha;
+    const get=await fetch(ghUrl(),{headers:ghHeaders(true)});
+    if(get.ok)sha=(await get.json()).sha;
+    else if(get.status!==404)throw new Error('чтение: HTTP '+get.status);
+    const put=await fetch(ghUrl(),{method:'PUT',headers:Object.assign(ghHeaders(true),{'Content-Type':'application/json'}),
+      body:JSON.stringify({message:'синхронизация птэ '+new Date().toLocaleString('ru-RU'),content:strToB64(JSON.stringify(payload)),sha,branch:gh.branch})});
+    if(!put.ok){const t=await put.text();let m='HTTP '+put.status;try{m+=': '+JSON.parse(t).message}catch(e){}throw new Error(m)}
+    if(!silent){toast('Сохранено в GitHub');ghStatus('сохранено '+dt(Date.now()))}
+    else ghStatus('автосохранено '+dt(Date.now()));
+    return true;
+  }catch(e){
+    if(!silent){toast('Ошибка сохранения: '+e.message);ghStatus('ошибка сохранения: '+e.message)}
+    return false;
+  }
+}
+function ghReadCfg(){
+  const repo=($('#ghRepo')&&$('#ghRepo').value||'').split('/');
+  if(repo.length===2&&repo[0].trim()&&repo[1].trim()){gh.owner=repo[0].trim();gh.repo=repo[1].trim()}
+  if($('#ghPath')&&$('#ghPath').value.trim())gh.path=$('#ghPath').value.trim();
+  if($('#ghBranch')&&$('#ghBranch').value.trim())gh.branch=$('#ghBranch').value.trim();
+  if($('#ghToken'))gh.token=$('#ghToken').value.trim();
+  LS.set('gh',gh);
+}
+const ghAutoPush=()=>{if(gh.token)ghPush(true)};
 
 const ROLES={
   admin:{name:'Администратор', def:'admin', views:[['admin','Админка'],['home','Главная'],['trainer','Тренажёр'],['stats','Статистика'],['results','Результаты']]},
@@ -12605,21 +12671,68 @@ function vGuest(){
 }
 
 /* ---------------- RESULTS (экзамен) ---------------- */
+const dayKey=t=>{const d=new Date(t);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
+function filteredResults(){
+  let list=results;
+  if(rF.mode==='date'){
+    const from=rF.from?new Date(rF.from+'T00:00:00').getTime():-Infinity;
+    const to=rF.to?new Date(rF.to+'T23:59:59.999').getTime():Infinity;
+    list=list.filter(r=>r.at>=from&&r.at<=to);
+  }else if(rF.mode==='grp'){
+    if(rF.grp)list=list.filter(r=>(r.grp||'—')===rF.grp);
+  }
+  return list;
+}
+function resultsChart(list){
+  const pts=list.slice().sort((a,b)=>a.at-b.at);
+  if(pts.length<2)return `<p class="muted small">Для графика нужно минимум два результата (сейчас: ${pts.length}).</p>`;
+  const W=700,H=280,L=46,R=16,T=18,B=42;
+  const t0=pts[0].at,t1=pts[pts.length-1].at,span=Math.max(1,t1-t0);
+  const X=t=>L+(t-t0)/span*(W-L-R);
+  const Y=p=>T+(100-p)/100*(H-T-B);
+  const grid=[0,25,50,75,100].map(v=>`<line x1="${L}" y1="${Y(v)}" x2="${W-R}" y2="${Y(v)}" stroke="var(--line)" stroke-width="1"/><text x="${L-7}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v}</text>`).join('');
+  const thr=`<line x1="${L}" y1="${Y(settings.passScore)}" x2="${W-R}" y2="${Y(settings.passScore)}" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="6 5" opacity=".7"/><text x="${W-R}" y="${Y(settings.passScore)-7}" text-anchor="end" font-size="11" fill="var(--accent)">порог ${settings.passScore}%</text>`;
+  const line=pts.map(p=>X(p.at).toFixed(1)+','+Y(p.pct).toFixed(1)).join(' ');
+  const dots=pts.map(p=>`<circle cx="${X(p.at).toFixed(1)}" cy="${Y(p.pct).toFixed(1)}" r="4.5" fill="var(--accent)"><title>${dt(p.at)} — ${p.pct}% (${p.right}/${p.total})${p.grp?', группа '+esc(p.grp):''}</title></circle>`).join('');
+  const xlab=`<text x="${L}" y="${H-14}" font-size="11" fill="var(--muted)">${dt(t0)}</text><text x="${W-R}" y="${H-14}" text-anchor="end" font-size="11" fill="var(--muted)">${dt(t1)}</text>`;
+  const avg=Math.round(pts.reduce((s,p)=>s+p.pct,0)/pts.length);
+  return `<p class="small muted">Результатов: ${pts.length} · средний балл: <b>${avg}%</b> · порог ${settings.passScore}%</p>
+  <div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="График динамики результатов экзамена">
+    ${grid}${thr}<polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>${dots}${xlab}
+  </svg></div>
+  <p class="small muted">Наведите на точку — увидите дату, результат и группу.</p>`;
+}
 function vResults(){
+  const admin=role==='admin';
   if(!results.length) return `<h1>Результаты экзаменов</h1>
     <div class="card empty"><div class="ic">📊</div><h2>Результатов пока нет</h2>
     <p>Здесь появятся результаты пройденных тестов в режиме экзамена, включая комментарии о нарушениях (сворачивание окна, копирование текста).</p></div>`;
+  const list=admin?filteredResults():results;
+  const groups=[...new Set(results.map(r=>r.grp||'—'))].sort((a,b)=>a.localeCompare(b,'ru'));
   return `<h1>Результаты экзаменов</h1>
   <p class="lead">Таблица результатов пройденных тестов в режиме экзамена. В комментариях фиксируются нарушения, если они были.</p>
+  ${admin?`<div class="card"><h2>Фильтр результатов</h2>
+    <div class="row mt" style="gap:8px">
+      ${[['all','Все'],['date','По дате'],['grp','По группе']].map(([m,n])=>`<button class="btn sm ${rF.mode===m?'primary':''}" data-act="r-mode" data-m="${m}">${n}</button>`).join('')}
+      ${rF.mode!=='all'?`<button class="btn sm ghost" data-act="r-reset">Сбросить фильтр</button>`:''}
+    </div>
+    ${rF.mode==='date'?`<div class="grid g2 mt">
+      <div><label class="fld">С даты</label><input type="date" id="rFrom" value="${rF.from}"></div>
+      <div><label class="fld">По дату</label><input type="date" id="rTo" value="${rF.to}"></div></div>`:''}
+    ${rF.mode==='grp'?`<div class="mt"><label class="fld">Группа</label>
+      <select id="rGrp"><option value="">— все группы —</option>${groups.map(g=>`<option ${rF.grp===g?'selected':''}>${esc(g)}</option>`).join('')}</select></div>`:''}
+    <p class="small muted mt">Показано ${list.length} из ${results.length} результатов</p>
+  </div>
+  <div class="card"><h2>Динамика результатов</h2>${resultsChart(list)}</div>`:''}
   <div class="card"><div class="table-wrap"><table><thead><tr>
     <th>ФИО</th><th>Группа</th><th>Дата</th><th>Результат</th><th>%</th><th>Время</th><th>Лимит</th><th>Зачёт</th><th>Комментарий</th>
   </tr></thead><tbody>
-  ${results.map(r=>`<tr><td class="small">${esc(r.fio||'—')}</td><td class="small">${esc(r.grp||'—')}</td><td class="small">${dt(r.at)}</td><td>${r.right}/${r.total}</td><td>${r.pct}%</td>
+  ${list.map(r=>`<tr><td class="small">${esc(r.fio||'—')}</td><td class="small">${esc(r.grp||'—')}</td><td class="small">${dt(r.at)}</td><td>${r.right}/${r.total}</td><td>${r.pct}%</td>
     <td class="small">${fmtTime(r.time)}</td><td class="small">${r.limit?fmtTime(r.limit):'—'}</td>
     <td>${r.pass?'<span class="badge c">зачтено</span>':'<span class="badge v">не зачтено</span>'}</td>
-    <td class="small">${r.comment?esc(r.comment):'—'}</td></tr>`).join('')}
+    <td class="small">${r.comment?esc(r.comment):'—'}</td></tr>`).join('')||'<tr><td colspan="9" class="center muted">Под фильтр ничего не подходит</td></tr>'}
   </tbody></table></div>
-  <div class="row mt"><button class="btn sm danger" data-act="results-clear">Очистить таблицу результатов</button></div></div>`;
+  ${admin?`<div class="row mt"><button class="btn sm danger" data-act="results-clear">Очистить таблицу результатов</button></div>`:''}</div>`;
 }
 
 /* ---------------- EXAM ---------------- */
@@ -12671,10 +12784,10 @@ function examResult(){
     ${exam.comment?`<div class="note small" style="text-align:left"><b>Комментарий:</b> ${esc(exam.comment)}</div>`:'<p class="small muted">Нарушений не зафиксировано.</p>'}</div>
     <div class="row" style="justify-content:center">
       <button class="btn primary" data-act="exam-start">Пройти ещё раз</button>
-      <button class="btn" data-act="exam-review">Разбор ошибок (${tot-r})</button>
-      ${canView('results')?`<button class="btn" data-act="view" data-v="results">Таблица результатов</button>`:''}
+      ${role!=='exam'?`<button class="btn" data-act="exam-review">Разбор ошибок (${tot-r})</button>`:''}
+      ${role!=='exam'&&canView('results')?`<button class="btn" data-act="view" data-v="results">Таблица результатов</button>`:''}
       <button class="btn ghost" data-act="auth-reset">На главную (выбор режима)</button></div></div>
-    ${exam.review?`<h2 class="mt">Разбор ответов</h2>${exam.ids.map((id,i)=>{
+    ${role!=='exam'&&exam.review?`<h2 class="mt">Разбор ответов</h2>${exam.ids.map((id,i)=>{
       const q=byId(id), order=exam.orders[i]||[0,1,2], chosenPos=exam.answers[i];
       const ok=order[chosenPos]===q.c;
       return `<div class="card"><div class="qmeta"><span class="tag">${esc(q.cat)}</span>
@@ -12730,6 +12843,24 @@ function vAdmin(){
     <div class="row mt"><button class="btn primary" data-act="exam-cfg-save">Сохранить настройки экзамена</button>
     <span class="small muted">0 — без ограничения / все вопросы набора</span></div>
     <p class="small muted mt">Экзамен: случайный порядок, неповторяющиеся вопросы. Сворачивание окна, переключение вкладки и копирование текста фиксируются и попадают в комментарии таблицы результатов.</p>
+  </div>
+
+  <div class="card"><h2>Онлайн-синхронизация (GitHub)</h2>
+    <p class="small muted">Результаты, экзаменационный набор и настройки хранятся в файле <b>${esc(gh.path)}</b> вашего репозитория и доступны с любого устройства.</p>
+    <div class="grid g3 mt">
+      <div><label class="fld">Репозиторий (владелец/имя)</label><input id="ghRepo" type="text" value="${esc(gh.owner+'/'+gh.repo)}"></div>
+      <div><label class="fld">Файл данных</label><input id="ghPath" type="text" value="${esc(gh.path)}"></div>
+      <div><label class="fld">Ветка</label><input id="ghBranch" type="text" value="${esc(gh.branch)}"></div>
+    </div>
+    <div class="mt"><label class="fld">Токен GitHub — нужен только для сохранения (загрузка работает и без него)</label>
+      <input id="ghToken" type="password" autocomplete="off" value="${esc(gh.token)}" placeholder="ghp_… или github_pat_…"></div>
+    <div class="row mt">
+      <button class="btn primary" data-act="gh-push">Сохранить в GitHub</button>
+      <button class="btn" data-act="gh-pull">Загрузить из GitHub</button>
+      <button class="btn ghost" data-act="gh-save-cfg">Запомнить подключение</button>
+    </div>
+    <p class="small muted mt" id="ghStatus">Статус: ${gh.token?'токен сохранён в этом браузере':'токен не задан — только загрузка'}</p>
+    <p class="small muted">Токен хранится лишь в этом браузере. Создайте его на GitHub: Settings → Developer settings → Personal access tokens → Fine-grained → выбрать репозиторий → Repository permissions: <b>Contents: Read and Write</b>. Репозиторий должен быть открытым (public), чтобы другие устройства могли загружать данные без токена. Синхронизация работает, когда страница открыта по http(s)-ссылке.</p>
   </div>
 
   <div class="card"><div class="row spread"><h2 style="margin:0">Вопросы</h2><span class="small muted">Найдено: ${pool.length}</span></div>
@@ -12849,6 +12980,7 @@ function finishExam(timeUp,early){
   results.unshift({at:Date.now(),right,total,pct,pass:pct>=settings.passScore,time:secs,limit:exam.limit,comment,
     fio:exam.fio||'',grp:exam.grp||''});
   results=results.slice(0,200);LS.set('results',results);
+  ghAutoPush();
   document.body.classList.remove('exam-lock');
   render();
 }
@@ -12980,9 +13112,18 @@ document.addEventListener('click',e=>{
     settings.examTime=Math.max(0,Math.min(600,parseInt($('#eTime').value)||0));
     settings.examCount=Math.max(0,Math.min(DB.length,parseInt($('#eCount').value)||0));
     settings.passScore=Math.min(100,Math.max(50,parseInt($('#ePass').value)||80));
-    LS.set('settings',settings);toast('Настройки экзамена сохранены');render();return;
+    LS.set('settings',settings);ghAutoPush();toast('Настройки экзамена сохранены');render();return;
   }
-  if(a==='results-clear'){if(confirm('Очистить таблицу результатов экзаменов?')){results=[];LS.set('results',results);render()}return}
+  if(a==='results-clear'){
+    if(role!=='admin'){toast('Очистка результатов доступна только администратору');return}
+    if(confirm('Очистить таблицу результатов экзаменов?')){results=[];LS.set('results',results);rF={mode:'all',from:'',to:'',grp:''};ghAutoPush();render()}
+    return;
+  }
+  if(a==='r-mode'){rF.mode=el.dataset.m;render();return}
+  if(a==='r-reset'){rF={mode:'all',from:'',to:'',grp:''};render();return}
+  if(a==='gh-save-cfg'){ghReadCfg();toast('Подключение сохранено');render();return}
+  if(a==='gh-pull'){ghReadCfg();ghStatus('загрузка…');ghPull(false);return}
+  if(a==='gh-push'){ghReadCfg();ghStatus('сохранение…');ghPush(false);return}
   if(a==='g-page'){gPage+=+el.dataset.d;render();return}
   if(a==='a-page'){aPage+=+el.dataset.d;render();return}
   if(a==='a-all'){adminSel=[...new Set(adminSel.concat(adminPool().map(q=>q.id)))];LS.set('adminSel',adminSel);render();return}
@@ -12990,9 +13131,10 @@ document.addEventListener('click',e=>{
   if(a==='a-save'){
     if(!adminSel.length){toast('Выберите хотя бы один вопрос');return}
     examSet={ids:adminSel.slice(),created:Date.now(),source:'ручной выбор'};LS.set('examSet',examSet);exam=null;
+    ghAutoPush();
     toast('Набор сохранён ('+adminSel.length+')');render();return;
   }
-  if(a==='a-clear'){examSet=null;LS.set('examSet',null);exam=null;toast('Набор удалён');render();return}
+  if(a==='a-clear'){examSet=null;LS.set('examSet',null);exam=null;ghAutoPush();toast('Набор удалён');render();return}
   if(a==='a-export'){
     const blob=new Blob([JSON.stringify(examSet,null,2)],{type:'application/json'});
     const u=URL.createObjectURL(blob);const link=document.createElement('a');link.href=u;link.download='pte-exam-set.json';link.click();URL.revokeObjectURL(u);return;
@@ -13019,6 +13161,9 @@ document.addEventListener('change',e=>{
   if(el.id==='aCat'){aFilter.cat=el.value;aPage=1;render();return}
   if(el.id==='aShow'){aFilter.show=el.value;aPage=1;render();return}
   if(el.id==='gCat'){gCat=el.value;gPage=1;render();return}
+  if(el.id==='rFrom'){rF.from=el.value;render();return}
+  if(el.id==='rTo'){rF.to=el.value;render();return}
+  if(el.id==='rGrp'){rF.grp=el.value;render();return}
 });
 document.addEventListener('input',e=>{
   if(e.target.id==='aSearch'){aFilter.search=e.target.value;aPage=1;
@@ -13077,6 +13222,7 @@ setInterval(()=>{
   if(exam.limit&&Date.now()-exam.start>=exam.limit*1000)finishExam(true);
 },1000);
 render();
+if(!results.length&&!examSet)ghPull(true);
 document.getElementById('app').dataset.boot='ready';
 </script>
 </body>
